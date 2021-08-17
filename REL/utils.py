@@ -1,5 +1,6 @@
 import json
 import re
+from itertools import compress
 
 import flair
 import numpy as np
@@ -68,13 +69,30 @@ def process_results(
     mentions_dataset,
     predictions,
     processed,
+    model,
+    canditates_number=7,
     include_offset=False,
 ):
     """
     Function that can be used to process the End-to-End results.
     :return: dictionary with results and document as key.
     """
+    def generate_cans_socres_embs(model,nUNK_candidates,nUNK_scores,selected_index):
+        selected_candidates = list(np.array(nUNK_candidates)[selected_index])
+        cans_embs = []
+        failed = [] # failed index
+        for idx,can in enumerate(selected_candidates):
+            emb = model.emb.emb([f'ENTITY/{can}'], 'embeddings')[0]
+            if emb == None: failed.append(idx)
+            else: cans_embs.append(emb)
+        for idx in failed[::-1]:
+            selected_candidates.pop(idx)
+            selected_index.pop(idx)
+        return selected_candidates,list(np.array(nUNK_scores).astype(np.float)[selected_index]),\
+            cans_embs,len(failed)!=0
+
     res = {}
+    failed_time = {} # number of mentions that embeddings of at least one entitiy cannot be found
     for doc in mentions_dataset:
         if doc not in predictions:
             # No mentions found, we return empty list.
@@ -83,26 +101,41 @@ def process_results(
         ment_doc = mentions_dataset[doc]
         text = processed[doc][0]
         res_doc = []
-
+        fails = 0 # number of failed embedding-retrival in this doc
         for pred, ment in zip(pred_doc, ment_doc):
             sent = ment["sentence"]
             idx = ment["sent_idx"]
             start_pos = ment["pos"]
             mention_length = int(ment["end_pos"] - ment["pos"])
-
             if pred["prediction"] != "NIL":
+                not_UNK = [cand!='#UNK#' for cand in pred['candidates']]
+                nUNK_candidates = list(compress(pred['candidates'],not_UNK))
+                nUNK_scores = list(compress(pred['scores'],not_UNK))
+                selected_index = (-np.array(nUNK_scores).astype(np.float))\
+                    .argsort().tolist()[:min(canditates_number,sum(not_UNK))] # scores from maximum to minimum
+                selected_candidates,selected_scores,cans_embs,fail \
+                    = generate_cans_socres_embs(model,nUNK_candidates,nUNK_scores,selected_index)
+                fails += fail
                 temp = (
                     start_pos,
                     mention_length,
                     ment["ngram"],
                     pred["prediction"],
                     pred["conf_ed"],
+                    selected_candidates,
+                    selected_scores,
+                    cans_embs,
                     ment["conf_md"] if "conf_md" in ment else 0.0,
                     ment["tag"] if "tag" in ment else "NULL",
-                )
-                res_doc.append(temp)
+                    )
+                res_doc.append(temp) # temp[5],temp[6],temp[7] could be [],[],[]
+                if len(cans_embs)!=0:
+                    assert np.shape(temp[7])==(len(temp[6]),300), \
+                    'Embedding counts not equal to Candidates counts'
+
         res[doc] = res_doc
-    return res
+        failed_time[doc] = fails
+    return res, failed_time
 
 
 def trim1(s):
